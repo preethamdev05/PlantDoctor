@@ -49,6 +49,10 @@ android {
 dependencies {
     // TensorFlow Lite
     implementation("org.tensorflow:tensorflow-lite:2.16.1")
+    
+    // CRITICAL: Required for models using Select TensorFlow Ops (FlexDelegate)
+    // The error "Select TensorFlow op(s)... not supported by this interpreter" requires this.
+    implementation("org.tensorflow:tensorflow-lite-select-tf-ops:2.16.1")
 
     // CameraX
     implementation("androidx.camera:camera-camera2:1.3.4")
