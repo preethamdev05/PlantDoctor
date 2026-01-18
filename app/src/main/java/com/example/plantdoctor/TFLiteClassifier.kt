@@ -30,6 +30,9 @@ class TFLiteClassifier(private val context: Context) {
     private var inputChannels = 3
     private var inputType: DataType = DataType.UINT8
     private var inputBytesPerElement: Int = 1
+    
+    // Debug info
+    private var debugInfo = ""
 
     companion object {
         private const val MODEL_FILE = "plant_doctor_edge_int8.tflite"
@@ -41,13 +44,22 @@ class TFLiteClassifier(private val context: Context) {
     fun initialize() {
         try {
             val modelBuffer = loadModelFile()
-            val options = Interpreter.Options().apply { setNumThreads(NUM_THREADS) }
+            // Add Flex Delegate support implicitly via dependency, but ensure options correct
+            val options = Interpreter.Options().apply { 
+                setNumThreads(NUM_THREADS)
+                // If the model uses Flex ops, we should NOT set strict CPU if it needs GPU/Flex
+            }
             interpreter = Interpreter(modelBuffer, options)
 
             labels = loadLabels()
             if (labels.isEmpty()) throw IllegalStateException("Labels file is empty")
 
-            readInputSpec(requireInterpreter().getInputTensor(0))
+            val t = requireInterpreter().getInputTensor(0)
+            readInputSpec(t)
+            
+            // Generate debug string
+            debugInfo = "Input: shape=${t.shape().contentToString()} type=${t.dataType()} bytes=${t.numBytes()} detected_bpe=$inputBytesPerElement"
+            
         } catch (e: Exception) {
             close()
             throw Exception("Failed to initialize classifier: ${e.message}", e)
@@ -90,11 +102,15 @@ class TFLiteClassifier(private val context: Context) {
                         argmaxScores(out.toList(), 1f)
                     }
                 }
+                
+                // If library actually supports FLOAT16 enum in future
+                // DataType.FLOAT16 -> { ... }
 
                 else -> throw IllegalStateException("Unsupported output tensor type: ${outTensor.dataType()}")
             }
         } catch (e: Exception) {
-            throw Exception("Inference failed: ${e.message}", e)
+            // Include debug info in error message
+            throw Exception("Inference failed ($debugInfo): ${e.message}", e)
         }
     }
 
@@ -127,40 +143,41 @@ class TFLiteClassifier(private val context: Context) {
 
         val elemCount = inputWidth * inputHeight * inputChannels
 
-        val result: Any = when (inputType) {
-            DataType.UINT8, DataType.INT8 -> {
-                val buf = ByteBuffer.allocateDirect(elemCount)
-                buf.order(ByteOrder.nativeOrder())
-                var p = 0
-                for (i in 0 until inputHeight) {
-                    for (j in 0 until inputWidth) {
-                        val v = intValues[p++]
-                        buf.put(((v shr 16) and 0xFF).toByte())
-                        buf.put(((v shr 8) and 0xFF).toByte())
-                        buf.put((v and 0xFF).toByte())
-                    }
-                }
-                buf.rewind()
-                buf
-            }
-
-            DataType.FLOAT32 -> {
-                if (inputBytesPerElement == 2) {
-                    // FLOAT16 input (half)
-                    val buf = ByteBuffer.allocateDirect(elemCount * 2).order(ByteOrder.nativeOrder())
+        // Determine target based on detected input bytes per element (2 = FP16, 4 = FP32, 1 = UINT8)
+        val result: Any = if (inputBytesPerElement == 2) {
+             // Force FP16 path regardless of Enum (often reports FLOAT32 but is actually FLOAT16)
+             val buf = ByteBuffer.allocateDirect(elemCount * 2).order(ByteOrder.nativeOrder())
+             var p = 0
+             for (i in 0 until inputHeight) {
+                 for (j in 0 until inputWidth) {
+                     val v = intValues[p++]
+                     buf.putShort(floatToHalf(((v shr 16) and 0xFF) / 255f))
+                     buf.putShort(floatToHalf(((v shr 8) and 0xFF) / 255f))
+                     buf.putShort(floatToHalf((v and 0xFF) / 255f))
+                 }
+             }
+             buf.rewind()
+             buf
+        } else {
+            when (inputType) {
+                DataType.UINT8 -> {
+                    val buf = ByteBuffer.allocateDirect(elemCount)
+                    buf.order(ByteOrder.nativeOrder())
                     var p = 0
                     for (i in 0 until inputHeight) {
                         for (j in 0 until inputWidth) {
                             val v = intValues[p++]
-                            buf.putShort(floatToHalf(((v shr 16) and 0xFF) / 255f))
-                            buf.putShort(floatToHalf(((v shr 8) and 0xFF) / 255f))
-                            buf.putShort(floatToHalf((v and 0xFF) / 255f))
+                            buf.put(((v shr 16) and 0xFF).toByte())
+                            buf.put(((v shr 8) and 0xFF).toByte())
+                            buf.put((v and 0xFF).toByte())
                         }
                     }
                     buf.rewind()
                     buf
-                } else {
-                    // FLOAT32 input
+                }
+
+                DataType.FLOAT32 -> {
+                    // Standard FP32
                     val buf = ByteBuffer.allocateDirect(elemCount * 4).order(ByteOrder.nativeOrder())
                     var p = 0
                     for (i in 0 until inputHeight) {
@@ -174,9 +191,9 @@ class TFLiteClassifier(private val context: Context) {
                     buf.rewind()
                     buf
                 }
-            }
 
-            else -> throw IllegalStateException("Unsupported input tensor type: $inputType")
+                else -> throw IllegalStateException("Unsupported input tensor type: $inputType")
+            }
         }
 
         if (cropped != bitmap && !cropped.isRecycled) cropped.recycle()
