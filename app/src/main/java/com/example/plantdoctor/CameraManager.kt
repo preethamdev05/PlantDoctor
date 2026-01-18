@@ -104,10 +104,6 @@ class CameraManager(private val context: Context) {
 
     /**
      * Converts ImageProxy (YUV_420_888) to Bitmap safely.
-     *
-     * Previous code assumed plane buffers are tightly packed; on many devices
-     * rowStride/pixelStride causes that to break and produces tiny/invalid JPEG data,
-     * leading to errors like "length=1; index=1".
      */
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
         if (image.format != ImageFormat.YUV_420_888) {
@@ -122,11 +118,16 @@ class CameraManager(private val context: Context) {
             throw IllegalStateException("YuvImage.compressToJpeg failed")
         }
         val imageBytes = out.toByteArray()
-        val bmp = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
             ?: throw IllegalStateException("Bitmap decode failed")
-        return bmp
     }
 
+    /**
+     * Properly converts YUV_420_888 planes into a single NV21 byte array.
+     *
+     * Fix: UV plane indexing must use chroma dimensions (width/2, height/2). Using the full
+     * luma width can overflow u/v buffers on devices with uvPixelStride/uvRowStride padding.
+     */
     private fun yuv420888ToNv21(image: ImageProxy): ByteArray {
         val width = image.width
         val height = image.height
@@ -145,35 +146,48 @@ class CameraManager(private val context: Context) {
 
         val nv21 = ByteArray(width * height + (width * height / 2))
 
-        var pos = 0
-
         // Copy Y plane
-        val y = ByteArray(yBuffer.remaining())
-        yBuffer.get(y)
-        var ySrcIndex = 0
-        for (row in 0 until height) {
-            System.arraycopy(y, ySrcIndex, nv21, pos, width)
-            pos += width
-            ySrcIndex += yRowStride
+        run {
+            val y = ByteArray(yBuffer.remaining())
+            yBuffer.get(y)
+            var dstIndex = 0
+            var srcIndex = 0
+            for (row in 0 until height) {
+                System.arraycopy(y, srcIndex, nv21, dstIndex, width)
+                dstIndex += width
+                srcIndex += yRowStride
+            }
         }
 
-        // Copy UV planes (interleaved VU for NV21)
-        val u = ByteArray(uBuffer.remaining())
-        val v = ByteArray(vBuffer.remaining())
-        uBuffer.get(u)
-        vBuffer.get(v)
+        // Copy UV planes (NV21 = VU interleaved)
+        run {
+            val u = ByteArray(uBuffer.remaining())
+            val v = ByteArray(vBuffer.remaining())
+            uBuffer.get(u)
+            vBuffer.get(v)
 
-        var uvSrcIndex = 0
-        for (row in 0 until height / 2) {
-            var col = 0
-            while (col < width) {
-                val uvIndex = uvSrcIndex + col * uvPixelStride
-                // NV21 expects V then U
-                nv21[pos++] = v[uvIndex]
-                nv21[pos++] = u[uvIndex]
-                col += 2
+            val chromaWidth = (width + 1) / 2
+            val chromaHeight = (height + 1) / 2
+
+            var dstIndex = width * height
+            var srcRowIndex = 0
+
+            for (row in 0 until chromaHeight) {
+                var srcCol = 0
+                for (col in 0 until chromaWidth) {
+                    val uvIndex = srcRowIndex + srcCol
+                    if (uvIndex >= u.size || uvIndex >= v.size) {
+                        throw IndexOutOfBoundsException(
+                            "UV index out of bounds (uvIndex=$uvIndex, uSize=${u.size}, vSize=${v.size}, uvRowStride=$uvRowStride, uvPixelStride=$uvPixelStride, width=$width, height=$height)"
+                        )
+                    }
+                    // NV21 expects V then U
+                    nv21[dstIndex++] = v[uvIndex]
+                    nv21[dstIndex++] = u[uvIndex]
+                    srcCol += uvPixelStride
+                }
+                srcRowIndex += uvRowStride
             }
-            uvSrcIndex += uvRowStride
         }
 
         return nv21
