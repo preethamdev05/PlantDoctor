@@ -1,0 +1,11 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <!-- simple green circle icon to satisfy aapt; replace with real launcher icon later -->
+    <path
+        android:fillColor="#2E7D32"
+        android:pathData="M54,4A50,50 0 1,0 54,104A50,50 0 1,0 54,4Z" />
+</vector>
