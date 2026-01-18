@@ -1,0 +1,9 @@
+<resources>
+    <string name="app_name">Plant Doctor</string>
+    <string name="no_result">Point camera at plant leaf</string>
+    <string name="confidence_placeholder">Confidence: --</string>
+    <string name="capture_description">Capture plant image</string>
+    <string name="camera_permission_denied">Camera permission is required</string>
+    <string name="model_load_error">Failed to load AI model</string>
+    <string name="inference_error">Classification failed</string>
+</resources>
