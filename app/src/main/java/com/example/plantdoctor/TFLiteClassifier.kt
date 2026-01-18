@@ -15,8 +15,9 @@ import kotlin.math.min
 /**
  * TensorFlow Lite classifier for plant disease detection.
  *
- * This implementation adapts preprocessing + output parsing to the *actual* model
- * input/output tensor types (UINT8 / FLOAT32 / FLOAT16).
+ * NOTE: TFLite Java DataType enum does not expose FLOAT16 on some versions.
+ * To support float16 ("half") tensors anyway, this code detects float16 via
+ * tensor.numBytes() / elementCount == 2, and then feeds/reads FP16 ByteBuffers.
  */
 class TFLiteClassifier(private val context: Context) {
 
@@ -28,6 +29,7 @@ class TFLiteClassifier(private val context: Context) {
     private var inputHeight = 224
     private var inputChannels = 3
     private var inputType: DataType = DataType.UINT8
+    private var inputBytesPerElement: Int = 1
 
     companion object {
         private const val MODEL_FILE = "plant_doctor_edge_int8.tflite"
@@ -39,17 +41,13 @@ class TFLiteClassifier(private val context: Context) {
     fun initialize() {
         try {
             val modelBuffer = loadModelFile()
-            val options = Interpreter.Options().apply {
-                setNumThreads(NUM_THREADS)
-            }
+            val options = Interpreter.Options().apply { setNumThreads(NUM_THREADS) }
             interpreter = Interpreter(modelBuffer, options)
 
             labels = loadLabels()
             if (labels.isEmpty()) throw IllegalStateException("Labels file is empty")
 
-            // Read model input tensor info
-            val t = requireInterpreter().getInputTensor(0)
-            readInputSpec(t)
+            readInputSpec(requireInterpreter().getInputTensor(0))
         } catch (e: Exception) {
             close()
             throw Exception("Failed to initialize classifier: ${e.message}", e)
@@ -63,10 +61,8 @@ class TFLiteClassifier(private val context: Context) {
         try {
             val input = preprocess(bitmap)
 
-            // Allocate output buffer based on output tensor (index 0)
             val outTensor = interp.getOutputTensor(0)
-            val outShape = outTensor.shape()
-            val outCount = outShape.fold(1) { acc, v -> acc * v }
+            val outCount = elementCount(outTensor)
 
             return when (outTensor.dataType()) {
                 DataType.UINT8 -> {
@@ -77,22 +73,22 @@ class TFLiteClassifier(private val context: Context) {
                 }
 
                 DataType.FLOAT32 -> {
-                    val out = FloatArray(outCount)
-                    interp.run(input, out)
-                    val scores = out.toList()
-                    argmaxScores(scores, 1f)
-                }
-
-                DataType.FLOAT16 -> {
-                    val out = ByteBuffer.allocateDirect(outCount * 2).order(ByteOrder.nativeOrder())
-                    interp.run(input, out)
-                    out.rewind()
-                    val scores = FloatArray(outCount)
-                    for (i in 0 until outCount) {
-                        val halfBits = out.short
-                        scores[i] = halfToFloat(halfBits)
+                    val outBytesPerElement = bytesPerElement(outTensor, outCount)
+                    if (outBytesPerElement == 2) {
+                        // FLOAT16 output hidden behind FLOAT32 enum in some builds
+                        val out = ByteBuffer.allocateDirect(outCount * 2).order(ByteOrder.nativeOrder())
+                        interp.run(input, out)
+                        out.rewind()
+                        val scores = FloatArray(outCount)
+                        for (i in 0 until outCount) {
+                            scores[i] = halfToFloat(out.short)
+                        }
+                        argmaxScores(scores.toList(), 1f)
+                    } else {
+                        val out = FloatArray(outCount)
+                        interp.run(input, out)
+                        argmaxScores(out.toList(), 1f)
                     }
-                    argmaxScores(scores.toList(), 1f)
                 }
 
                 else -> throw IllegalStateException("Unsupported output tensor type: ${outTensor.dataType()}")
@@ -120,7 +116,7 @@ class TFLiteClassifier(private val context: Context) {
     }
 
     /**
-     * Preprocess bitmap according to model input shape/type.
+     * Preprocess bitmap according to model input shape and bytes/element.
      */
     private fun preprocess(bitmap: Bitmap): Any {
         val cropped = centerCropSquare(bitmap)
@@ -129,9 +125,11 @@ class TFLiteClassifier(private val context: Context) {
         val intValues = IntArray(inputWidth * inputHeight)
         resized.getPixels(intValues, 0, inputWidth, 0, 0, inputWidth, inputHeight)
 
+        val elemCount = inputWidth * inputHeight * inputChannels
+
         val result: Any = when (inputType) {
-            DataType.UINT8 -> {
-                val buf = ByteBuffer.allocateDirect(inputWidth * inputHeight * inputChannels)
+            DataType.UINT8, DataType.INT8 -> {
+                val buf = ByteBuffer.allocateDirect(elemCount)
                 buf.order(ByteOrder.nativeOrder())
                 var p = 0
                 for (i in 0 until inputHeight) {
@@ -147,37 +145,35 @@ class TFLiteClassifier(private val context: Context) {
             }
 
             DataType.FLOAT32 -> {
-                val buf = ByteBuffer.allocateDirect(inputWidth * inputHeight * inputChannels * 4)
-                buf.order(ByteOrder.nativeOrder())
-                var p = 0
-                for (i in 0 until inputHeight) {
-                    for (j in 0 until inputWidth) {
-                        val v = intValues[p++]
-                        // Normalize 0..1 (safe default)
-                        buf.putFloat(((v shr 16) and 0xFF) / 255f)
-                        buf.putFloat(((v shr 8) and 0xFF) / 255f)
-                        buf.putFloat((v and 0xFF) / 255f)
+                if (inputBytesPerElement == 2) {
+                    // FLOAT16 input (half)
+                    val buf = ByteBuffer.allocateDirect(elemCount * 2).order(ByteOrder.nativeOrder())
+                    var p = 0
+                    for (i in 0 until inputHeight) {
+                        for (j in 0 until inputWidth) {
+                            val v = intValues[p++]
+                            buf.putShort(floatToHalf(((v shr 16) and 0xFF) / 255f))
+                            buf.putShort(floatToHalf(((v shr 8) and 0xFF) / 255f))
+                            buf.putShort(floatToHalf((v and 0xFF) / 255f))
+                        }
                     }
-                }
-                buf.rewind()
-                buf
-            }
-
-            DataType.FLOAT16 -> {
-                val buf = ByteBuffer.allocateDirect(inputWidth * inputHeight * inputChannels * 2)
-                buf.order(ByteOrder.nativeOrder())
-                var p = 0
-                for (i in 0 until inputHeight) {
-                    for (j in 0 until inputWidth) {
-                        val v = intValues[p++]
-                        // Normalize 0..1 then convert to FP16
-                        buf.putShort(floatToHalf(((v shr 16) and 0xFF) / 255f))
-                        buf.putShort(floatToHalf(((v shr 8) and 0xFF) / 255f))
-                        buf.putShort(floatToHalf((v and 0xFF) / 255f))
+                    buf.rewind()
+                    buf
+                } else {
+                    // FLOAT32 input
+                    val buf = ByteBuffer.allocateDirect(elemCount * 4).order(ByteOrder.nativeOrder())
+                    var p = 0
+                    for (i in 0 until inputHeight) {
+                        for (j in 0 until inputWidth) {
+                            val v = intValues[p++]
+                            buf.putFloat(((v shr 16) and 0xFF) / 255f)
+                            buf.putFloat(((v shr 8) and 0xFF) / 255f)
+                            buf.putFloat((v and 0xFF) / 255f)
+                        }
                     }
+                    buf.rewind()
+                    buf
                 }
-                buf.rewind()
-                buf
             }
 
             else -> throw IllegalStateException("Unsupported input tensor type: $inputType")
@@ -205,6 +201,18 @@ class TFLiteClassifier(private val context: Context) {
             inputWidth = shape[2]
             inputChannels = shape[3]
         }
+
+        val count = elementCount(t)
+        inputBytesPerElement = bytesPerElement(t, count)
+    }
+
+    private fun elementCount(t: Tensor): Int {
+        return t.shape().fold(1) { acc, v -> acc * v }
+    }
+
+    private fun bytesPerElement(t: Tensor, elementCount: Int): Int {
+        val total = t.numBytes()
+        return if (elementCount <= 0) 0 else (total / elementCount)
     }
 
     private fun requireInterpreter(): Interpreter {
@@ -229,9 +237,6 @@ class TFLiteClassifier(private val context: Context) {
         interpreter = null
     }
 
-    /**
-     * Float32 -> IEEE754 FP16 bits.
-     */
     private fun floatToHalf(f: Float): Short {
         val bits = java.lang.Float.floatToIntBits(f)
         val sign = (bits ushr 16) and 0x8000
@@ -239,17 +244,12 @@ class TFLiteClassifier(private val context: Context) {
         var valMant = bits and 0x7FFFFF
 
         if (valExp == 255) {
-            // NaN/Inf
             return (sign or 0x7C00 or (if (valMant != 0) 0x01 else 0)).toShort()
         }
 
         valExp = valExp - 127 + 15
-        if (valExp >= 31) {
-            // Overflow -> Inf
-            return (sign or 0x7C00).toShort()
-        }
+        if (valExp >= 31) return (sign or 0x7C00).toShort()
         if (valExp <= 0) {
-            // Subnormal/underflow
             if (valExp < -10) return sign.toShort()
             valMant = (valMant or 0x800000) shr (1 - valExp)
             return (sign or ((valMant + 0x1000) shr 13)).toShort()
@@ -258,9 +258,6 @@ class TFLiteClassifier(private val context: Context) {
         return (sign or (valExp shl 10) or ((valMant + 0x1000) shr 13)).toShort()
     }
 
-    /**
-     * IEEE754 FP16 bits -> Float32.
-     */
     private fun halfToFloat(h: Short): Float {
         val bits = h.toInt() and 0xFFFF
         val sign = (bits and 0x8000) shl 16
@@ -271,7 +268,6 @@ class TFLiteClassifier(private val context: Context) {
             exp == 0 -> {
                 if (mant == 0) sign
                 else {
-                    // Subnormal
                     while ((mant and 0x0400) == 0) {
                         mant = mant shl 1
                         exp -= 1
