@@ -22,7 +22,6 @@ class TFLiteClassifier(private val context: Context) {
         private const val MODEL_FILE = "plant_doctor_edge_int8.tflite"
         private const val LABELS_FILE = "labels.txt"
         private const val NUM_THREADS = 4
-        private const val OUTPUT_SIZE = 38 // Number of classes
     }
 
     /**
@@ -43,11 +42,10 @@ class TFLiteClassifier(private val context: Context) {
 
             // Load labels
             labels = loadLabels()
-
-            if (labels.size != OUTPUT_SIZE) {
-                throw IllegalStateException(
-                    "Expected $OUTPUT_SIZE labels, found ${labels.size}"
-                )
+            
+            // Basic validation
+            if (labels.isEmpty()) {
+                throw IllegalStateException("Labels file is empty")
             }
         } catch (e: Exception) {
             close()
@@ -71,8 +69,11 @@ class TFLiteClassifier(private val context: Context) {
             // Preprocess image
             val inputBuffer = preprocessor.preprocess(bitmap)
 
-            // Prepare output buffer (UINT8, shape: 1x38)
-            val outputBuffer = ByteBuffer.allocateDirect(OUTPUT_SIZE)
+            // Use dynamic output size based on labels count
+            val outputSize = labels.size
+            
+            // Prepare output buffer (UINT8, shape: 1xN)
+            val outputBuffer = ByteBuffer.allocateDirect(outputSize)
             outputBuffer.rewind()
 
             // Run inference
@@ -80,7 +81,7 @@ class TFLiteClassifier(private val context: Context) {
 
             // Post-process output
             outputBuffer.rewind()
-            val outputArray = ByteArray(OUTPUT_SIZE)
+            val outputArray = ByteArray(outputSize)
             outputBuffer.get(outputArray)
 
             // Convert UINT8 to int (0-255) and find argmax
