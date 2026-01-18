@@ -85,8 +85,12 @@ class MainActivity : AppCompatActivity() {
                 classifier.initialize()
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    showError(getString(R.string.model_load_error))
+                    // SHOW ACTUAL ERROR MESSAGE
+                    val errorMessage = "Model Error: ${e.message}"
+                    showError(errorMessage)
                     captureButton.isEnabled = false
+                    // Log to logcat for easier debugging
+                    android.util.Log.e("PlantDoctor", "Classifier initialization failed", e)
                 }
             }
         }
