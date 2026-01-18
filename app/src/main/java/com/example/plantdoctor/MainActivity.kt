@@ -85,11 +85,9 @@ class MainActivity : AppCompatActivity() {
                 classifier.initialize()
             } catch (e: Exception) {
                 withContext(Dispatchers.Main) {
-                    // SHOW ACTUAL ERROR MESSAGE
                     val errorMessage = "Model Error: ${e.message}"
                     showError(errorMessage)
                     captureButton.isEnabled = false
-                    // Log to logcat for easier debugging
                     android.util.Log.e("PlantDoctor", "Classifier initialization failed", e)
                 }
             }
@@ -138,13 +136,18 @@ class MainActivity : AppCompatActivity() {
 
         cameraManager.captureImage(
             onImageCaptured = { bitmap ->
+                // CameraX callbacks run on a background thread.
+                // We proceed to classification, but UI updates must be handled carefully.
                 classifyImage(bitmap)
             },
             onError = { error ->
-                hideOverlay()
-                showError(error)
-                isProcessing = false
-                captureButton.isEnabled = true
+                // FIX: Ensure UI updates run on Main Thread
+                runOnUiThread {
+                    hideOverlay()
+                    showError(error)
+                    isProcessing = false
+                    captureButton.isEnabled = true
+                }
             }
         )
     }
