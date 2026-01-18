@@ -29,10 +29,6 @@ class CameraManager(private val context: Context) {
 
     /**
      * Starts the camera and binds to lifecycle.
-     *
-     * @param lifecycleOwner Activity or fragment lifecycle owner
-     * @param previewView PreviewView for camera preview
-     * @param onError Error callback
      */
     fun startCamera(
         lifecycleOwner: LifecycleOwner,
@@ -45,25 +41,21 @@ class CameraManager(private val context: Context) {
             try {
                 val cameraProvider = cameraProviderFuture.get()
 
-                // Preview use case
                 val preview = Preview.Builder()
                     .build()
                     .also {
                         it.setSurfaceProvider(previewView.surfaceProvider)
                     }
 
-                // Image capture use case
                 imageCapture = ImageCapture.Builder()
                     .setCaptureMode(ImageCapture.CAPTURE_MODE_MINIMIZE_LATENCY)
+                    // Ensure we always get a compatible format for conversion below
+                    .setBufferFormat(ImageFormat.YUV_420_888)
                     .build()
 
-                // Select back camera
                 val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
-                // Unbind all use cases before rebinding
                 cameraProvider.unbindAll()
-
-                // Bind use cases to camera
                 cameraProvider.bindToLifecycle(
                     lifecycleOwner,
                     cameraSelector,
@@ -78,9 +70,6 @@ class CameraManager(private val context: Context) {
 
     /**
      * Captures an image and returns it as a Bitmap.
-     *
-     * @param onImageCaptured Callback with captured bitmap
-     * @param onError Error callback
      */
     fun captureImage(
         onImageCaptured: (Bitmap) -> Unit,
@@ -114,28 +103,80 @@ class CameraManager(private val context: Context) {
     }
 
     /**
-     * Converts ImageProxy to Bitmap.
+     * Converts ImageProxy (YUV_420_888) to Bitmap safely.
+     *
+     * Previous code assumed plane buffers are tightly packed; on many devices
+     * rowStride/pixelStride causes that to break and produces tiny/invalid JPEG data,
+     * leading to errors like "length=1; index=1".
      */
     private fun imageProxyToBitmap(image: ImageProxy): Bitmap {
-        val yBuffer = image.planes[0].buffer
-        val uBuffer = image.planes[1].buffer
-        val vBuffer = image.planes[2].buffer
+        if (image.format != ImageFormat.YUV_420_888) {
+            throw IllegalArgumentException("Unsupported image format: ${image.format}")
+        }
 
-        val ySize = yBuffer.remaining()
-        val uSize = uBuffer.remaining()
-        val vSize = vBuffer.remaining()
-
-        val nv21 = ByteArray(ySize + uSize + vSize)
-
-        yBuffer.get(nv21, 0, ySize)
-        vBuffer.get(nv21, ySize, vSize)
-        uBuffer.get(nv21, ySize + vSize, uSize)
-
+        val nv21 = yuv420888ToNv21(image)
         val yuvImage = YuvImage(nv21, ImageFormat.NV21, image.width, image.height, null)
         val out = ByteArrayOutputStream()
-        yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 100, out)
+        val ok = yuvImage.compressToJpeg(Rect(0, 0, image.width, image.height), 95, out)
+        if (!ok) {
+            throw IllegalStateException("YuvImage.compressToJpeg failed")
+        }
         val imageBytes = out.toByteArray()
-        return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        val bmp = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+            ?: throw IllegalStateException("Bitmap decode failed")
+        return bmp
+    }
+
+    private fun yuv420888ToNv21(image: ImageProxy): ByteArray {
+        val width = image.width
+        val height = image.height
+
+        val yPlane = image.planes[0]
+        val uPlane = image.planes[1]
+        val vPlane = image.planes[2]
+
+        val yBuffer = yPlane.buffer
+        val uBuffer = uPlane.buffer
+        val vBuffer = vPlane.buffer
+
+        val yRowStride = yPlane.rowStride
+        val uvRowStride = uPlane.rowStride
+        val uvPixelStride = uPlane.pixelStride
+
+        val nv21 = ByteArray(width * height + (width * height / 2))
+
+        var pos = 0
+
+        // Copy Y plane
+        val y = ByteArray(yBuffer.remaining())
+        yBuffer.get(y)
+        var ySrcIndex = 0
+        for (row in 0 until height) {
+            System.arraycopy(y, ySrcIndex, nv21, pos, width)
+            pos += width
+            ySrcIndex += yRowStride
+        }
+
+        // Copy UV planes (interleaved VU for NV21)
+        val u = ByteArray(uBuffer.remaining())
+        val v = ByteArray(vBuffer.remaining())
+        uBuffer.get(u)
+        vBuffer.get(v)
+
+        var uvSrcIndex = 0
+        for (row in 0 until height / 2) {
+            var col = 0
+            while (col < width) {
+                val uvIndex = uvSrcIndex + col * uvPixelStride
+                // NV21 expects V then U
+                nv21[pos++] = v[uvIndex]
+                nv21[pos++] = u[uvIndex]
+                col += 2
+            }
+            uvSrcIndex += uvRowStride
+        }
+
+        return nv21
     }
 
     /**
