@@ -1,0 +1,3 @@
+PLACEHOLDER_FOR_REAL_MODEL_FILE
+Replace this file with the actual binary .tflite model.
+This file ensures the app builds and the filename exists in assets.
