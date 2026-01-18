@@ -14,7 +14,10 @@ class ImagePreprocessor {
     companion object {
         private const val INPUT_SIZE = 224
         private const val PIXEL_SIZE = 3 // RGB
-        private const val BUFFER_SIZE = INPUT_SIZE * INPUT_SIZE * PIXEL_SIZE
+        // IMPORTANT: Some models expect batch dimension (1, 224, 224, 3) or (1, 300, 300, 3).
+        // If your model input is larger than 224x224 (e.g. 300x300 for EfficientDet), update this.
+        // Assuming 224x224 input for typical MobileNet/ResNet models.
+        private const val BUFFER_SIZE = 1 * INPUT_SIZE * INPUT_SIZE * PIXEL_SIZE 
     }
 
     /**
@@ -48,22 +51,27 @@ class ImagePreprocessor {
         val intValues = IntArray(INPUT_SIZE * INPUT_SIZE)
         resizedBitmap.getPixels(intValues, 0, INPUT_SIZE, 0, 0, INPUT_SIZE, INPUT_SIZE)
 
-        var pixel = 0
-        for (i in 0 until INPUT_SIZE) {
-            for (j in 0 until INPUT_SIZE) {
-                val value = intValues[pixel++]
-                // Extract RGB (no normalization, UINT8 range 0-255)
-                byteBuffer.put(((value shr 16) and 0xFF).toByte()) // R
-                byteBuffer.put(((value shr 8) and 0xFF).toByte())  // G
-                byteBuffer.put((value and 0xFF).toByte())          // B
+        try {
+            var pixel = 0
+            for (i in 0 until INPUT_SIZE) {
+                for (j in 0 until INPUT_SIZE) {
+                    val value = intValues[pixel++]
+                    // Extract RGB (no normalization, UINT8 range 0-255)
+                    byteBuffer.put(((value shr 16) and 0xFF).toByte()) // R
+                    byteBuffer.put(((value shr 8) and 0xFF).toByte())  // G
+                    byteBuffer.put((value and 0xFF).toByte())          // B
+                }
             }
+        } catch (e: Exception) {
+            // Catch buffer overflow if pixel loop exceeds allocated size
+            throw RuntimeException("Image conversion failed: ${e.message}", e)
         }
 
         // Recycle bitmaps to free memory
-        if (croppedBitmap != bitmap) {
+        if (croppedBitmap != bitmap && !croppedBitmap.isRecycled) {
             croppedBitmap.recycle()
         }
-        if (resizedBitmap != croppedBitmap) {
+        if (resizedBitmap != croppedBitmap && !resizedBitmap.isRecycled) {
             resizedBitmap.recycle()
         }
 
